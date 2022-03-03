@@ -9,7 +9,9 @@ import numpy as np
 import pandas as pd
 from typing import List
 import numba
-
+from time import time
+import collections
+import timeit
 
 @torch.no_grad()
 def divide2trajectories(data):
@@ -30,12 +32,10 @@ def divide2trajectories(data):
 def dict_to_tensor(inputs, device):
     return {k: torch.tensor(v, device=device, dtype=torch.float32) for k, v in inputs.items()}
 
-@torch.no_grad()
-@torch.jit.script
-def get_returns(starts: torch.Tensor, ends: torch.Tensor, rewards: torch.Tensor, discount: float):
-    returns = [(rewards[start: end]*(torch.cumprod(torch.ones(end-start, device=rewards.device)*discount, dim=0))/discount).sum()
+def get_returns(starts, ends, rewards, discount: float):
+    returns = [(rewards[start: end]*(np.cumprod(np.ones(end-start)*discount, axis=0))/discount).sum()
                for start, end in zip(starts, ends)]
-    return torch.stack(returns)
+    return np.stack(returns)
 
 @numba.jit(nopython=True, parallel=True)
 def get_return(start, end, rewards):
@@ -93,7 +93,7 @@ class TunnelDataSet():
                 self.test_data["returns"].append(returns)
                 test_index += 1
                 current_test_size += returns.shape[0]
-            self.test_data = {k:torch.cat(v) for k, v in self.test_data.items()}
+            self.test_data = {k:np.concatenate(v) for k, v in self.test_data.items()}
             test_source, test_target = self.batching_from_indices(self.test_data["observations"], self.test_data["starts"],
                                                      self.test_data["ends"])
             self.batched_test = dict(source=test_source, target=test_target, returns=self.test_data["returns"],
@@ -103,8 +103,7 @@ class TunnelDataSet():
 
     @torch.no_grad()
     def sample_minibatch(self, nb_trajectories, pairs_per_trajectory):
-        trajectory_idx = torch.randint(self.nb_train_trajectories, size=(nb_trajectories,),
-                                       device=self.train_raw["rewards"][0].device)
+        trajectory_idx = np.random.randint(self.nb_train_trajectories, size=(nb_trajectories,))
         observations = [self.train_raw["observations"][i] for i in trajectory_idx]
         rewards = [self.train_raw["rewards"][i] for i in trajectory_idx]
 
@@ -114,42 +113,40 @@ class TunnelDataSet():
         batched_distance = []
         for observation, reward in zip(observations, rewards):
             length = observation.shape[0]
-            rand_idx = torch.randint(length, size=(pairs_per_trajectory, 2), device=reward.device)
-            start_idx = rand_idx.min(dim=1).values
-            end_idx = rand_idx.max(dim=1).values
+            rand_idx = np.random.randint(length, size=(pairs_per_trajectory, 2))
+            start_idx = rand_idx.min(axis=1)
+            end_idx = rand_idx.max(axis=1)
 
             batched_source.append(observation[start_idx])
             batched_target.append(observation[end_idx])
             batched_returns.append(get_returns(start_idx, end_idx, reward, self.discount))
             batched_distance.append(self.discount**(end_idx-start_idx))
 
-        batched_source = torch.cat(batched_source, dim=0)
-        batched_target = torch.cat(batched_target, dim=0)
-        batched_returns = torch.cat(batched_returns, dim=0)
-        batched_distance = torch.cat(batched_distance, dim=0)
+        batched_source = np.concatenate(batched_source, axis=0)
+        batched_target = np.concatenate(batched_target, axis=0)
+        batched_returns = np.concatenate(batched_returns, axis=0)
+        batched_distance = np.concatenate(batched_distance, axis=0)
         return dict(source=batched_source, target=batched_target, returns=batched_returns, distance=batched_distance)
 
-    @torch.no_grad()
     def batching_from_indices(self, observations, starts, ends):
         source = observations[starts]
         target = observations[ends]
         return source, target
 
-    @torch.no_grad()
     def trajectory2pairs(self, rewards):
         length = rewards.shape[0]
         start_indices = []
         end_indices = []
         for start in range(length):
-            start_indices.append(torch.ones(length-start, dtype=torch.int64, device=rewards.device)*start)
-            end_indices.append(torch.arange(start, length, dtype=torch.int64, device=rewards.device))
-        starts, ends = torch.cat(start_indices), torch.cat(end_indices)
+            start_indices.append(np.ones(length-start, dtype=np.int32)*start)
+            end_indices.append(np.arange(start, length, dtype=np.int32))
+        starts, ends = np.concatenate(start_indices), np.concatenate(end_indices)
         returns = get_returns(starts, ends, rewards, self.discount)
         return starts, ends, returns
 
 
 class TunnelModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, hidden_layers=1):
+    def __init__(self, input_size, hidden_size=128, hidden_layers=2):
         super(TunnelModel, self).__init__()
         self.projection = nn.Sequential(nn.Linear(input_size, hidden_size), nn.ReLU())
         hiddens = []
@@ -180,7 +177,7 @@ if __name__ == "__main__":
     # parser.add_argument("--distance_head", default="discount", type=str)
 
     parser.add_argument("--batch_size", default=20480, type=int)
-    parser.add_argument("--pairs", default=512, type=int)
+    parser.add_argument("--pairs", default=64, type=int)
     parser.add_argument("--iterations", default=1e6, type=int)
     parser.add_argument("--lr", default=0.0001, type=int)
 
@@ -205,7 +202,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    raw_dataset = dict_to_tensor(env.get_dataset(), device="cpu")
+    raw_dataset = env.get_dataset()
     dataset = TunnelDataSet(divide2trajectories(raw_dataset), args.test_size, args.discount)
     model = TunnelModel(raw_dataset["observations"].shape[-1])
     model.to(device=device)
@@ -253,3 +250,84 @@ if __name__ == "__main__":
             }, results_dir+"/model.ckpt")
             print(f"iteration {step}, return loss {return_loss.item()}, distance_loss {distance_loss.item()},"
                   f"test return error {return_error.item()}, test distance error {distance_error.item()}")
+
+
+class Timings:
+    """Not thread-safe."""
+
+    def __init__(self):
+        self._means = collections.defaultdict(int)
+        self._vars = collections.defaultdict(int)
+        self._counts = collections.defaultdict(int)
+        self.reset()
+
+    def reset(self):
+        self.last_time = timeit.default_timer()
+
+    def time(self, name):
+        """Save an update for event `name`.
+        Nerd alarm: We could just store a
+            collections.defaultdict(list)
+        and compute means and standard deviations at the end. But thanks to the
+        clever math in Sutton-Barto
+        (http://www.incompleteideas.net/book/first/ebook/node19.html) and
+        https://math.stackexchange.com/a/103025/5051 we can update both the
+        means and the stds online. O(1) FTW!
+        """
+        now = timeit.default_timer()
+        x = now - self.last_time
+        self.last_time = now
+
+        n = self._counts[name]
+
+        mean = self._means[name] + (x - self._means[name]) / (n + 1)
+        var = (
+            n * self._vars[name] + n * (self._means[name] - mean) ** 2 + (x - mean) ** 2
+        ) / (n + 1)
+
+        self._means[name] = mean
+        self._vars[name] = var
+        self._counts[name] += 1
+
+    def means(self):
+        return self._means
+
+    def vars(self):
+        return self._vars
+
+    def stds(self):
+        return {k: v ** 0.5 for k, v in self._vars.items()}
+
+    def summary2(self, prefix=""):
+        """
+        used for uneven count case
+        """
+        means = self.means()
+        counts = np.array([self._counts[k] for k in means.keys()])
+        total = sum(np.array(list(means.values()))*counts)
+
+        result = prefix
+        for k in sorted(means, key=means.get, reverse=True):
+            result += f"\n    %s: %.6fs (%.2f%%) " % (
+                k,
+                self._counts[k] * means[k],
+                100 * self._counts[k] * means[k] / total,
+            )
+        result += "\nTotal: %.6fs" % (total)
+        return result
+
+    def summary(self, prefix=""):
+        means = self.means()
+        stds = self.stds()
+        total = sum(means.values())
+
+        result = prefix
+        for k in sorted(means, key=means.get, reverse=True):
+            result += f"\n    %s: %.6fms +- %.6fms (%.2f%%) " % (
+                k,
+                1000 * means[k],
+                1000 * stds[k],
+                100 * means[k] / total,
+            )
+        result += "\nTotal: %.6fms" % (1000 * total)
+        return result
