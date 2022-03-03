@@ -129,11 +129,13 @@ class TunnelDataSet():
         batched_distance = torch.cat(batched_distance, dim=0)
         return dict(source=batched_source, target=batched_target, returns=batched_returns, distance=batched_distance)
 
+    @torch.no_grad()
     def batching_from_indices(self, observations, starts, ends):
         source = observations[starts]
         target = observations[ends]
         return source, target
 
+    @torch.no_grad()
     def trajectory2pairs(self, rewards):
         length = rewards.shape[0]
         start_indices = []
@@ -203,7 +205,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    raw_dataset = dict_to_tensor(env.get_dataset(), device=device)
+    raw_dataset = dict_to_tensor(env.get_dataset(), device="cpu")
     dataset = TunnelDataSet(divide2trajectories(raw_dataset), args.test_size, args.discount)
     model = TunnelModel(raw_dataset["observations"].shape[-1])
     model.to(device=device)
@@ -221,7 +223,7 @@ if __name__ == "__main__":
                                                       dataset.discount,
                                                       args.batch_size//args.pairs, args.pairs), device=device)
         """
-        minibatch = dataset.sample_minibatch(args.batch_size//args.pairs, args.pairs)
+        minibatch = dict_to_tensor(dataset.sample_minibatch(args.batch_size//args.pairs, args.pairs), device=device)
         returns_pred, distance_pred = model(minibatch["source"], minibatch["target"])
         return_loss = loss_f(returns_pred, minibatch["returns"])
         distance_loss = loss_f(distance_pred, minibatch["distance"])
@@ -232,7 +234,7 @@ if __name__ == "__main__":
 
         if step % args.log_period == 0:
             with torch.no_grad():
-                test_data = dataset.batched_test
+                test_data = dict_to_tensor(dataset.batched_test, device=device)
                 returns_pred, distance_pred = model(test_data["source"], test_data["target"])
                 return_error = torch.mean(torch.abs(returns_pred-test_data["returns"]))
                 distance_error = torch.mean(torch.abs(distance_pred-test_data["distance"]))
