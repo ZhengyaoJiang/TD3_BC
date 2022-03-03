@@ -13,15 +13,14 @@ from time import time
 import collections
 import timeit
 
-@torch.no_grad()
-def divide2trajectories(data):
+def divide2trajectories(data, max_length=100):
     length = data["terminals"].shape[0]
     rewards = []
     observations = []
     actions = []
     start_idx = 0
     for i in range(length):
-        if data["terminals"][i] == True:
+        if data["terminals"][i] == True or (i-start_idx)==max_length:
             rewards.append(data["rewards"][start_idx:i])
             observations.append(data["observations"][start_idx:i])
             actions.append(data["actions"][start_idx:i])
@@ -206,13 +205,23 @@ if __name__ == "__main__":
     dataset = TunnelDataSet(divide2trajectories(raw_dataset), args.test_size, args.discount)
     model = TunnelModel(raw_dataset["observations"].shape[-1])
     model.to(device=device)
-
     loss_f = nn.MSELoss(reduction="mean")
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
+    try:
+        checkpoint = torch.load(results_dir+"/model.ckpt")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start = checkpoint['step']
+        print(f"load model at {results_dir}, starting from step {start}")
+    except:
+        print(f"no exsisting model")
+        start = 0
+
+
     record = dict(step=[], return_loss=[], distance_loss=[], test_return_error=[], test_distance_error=[])
 
-    for step in range(int(args.iterations)):
+    for step in range(start, int(args.iterations)):
         """
         minibatch = dict_to_tensor(sample_minibatch(dataset.train_raw["observations"],
                                                       dataset.train_raw["rewards"],
@@ -224,7 +233,8 @@ if __name__ == "__main__":
         returns_pred, distance_pred = model(minibatch["source"], minibatch["target"])
         return_loss = loss_f(returns_pred, minibatch["returns"])
         distance_loss = loss_f(distance_pred, minibatch["distance"])
-        loss = return_loss+distance_loss
+        #loss = 1e-5*return_loss+distance_loss
+        loss = distance_loss
         loss.backward()
         optimizer.step()
 
