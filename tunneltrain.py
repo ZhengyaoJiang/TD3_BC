@@ -112,7 +112,7 @@ class TunnelDataSet():
         batched_distance = []
         for observation, reward in zip(observations, rewards):
             length = observation.shape[0]
-            rand_idx = np.random.randint(length, size=(pairs_per_trajectory, 2))
+            rand_idx = np.random.randint(0, length, size=(pairs_per_trajectory, 2))
             start_idx = rand_idx.min(axis=1)
             end_idx = rand_idx.max(axis=1)
 
