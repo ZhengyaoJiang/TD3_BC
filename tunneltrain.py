@@ -159,7 +159,7 @@ class TunnelModel(nn.Module):
     def forward(self, source, target):
         source_latent = self.projection(source)
         target_latent = self.projection(target)
-        latent = torch.concat([source_latent, target_latent], dim=1)
+        latent = torch.cat([source_latent, target_latent], dim=1)
         x = self.hidden(latent)
         returns = self.return_head(x)
         distance = self.distance_head(x)
